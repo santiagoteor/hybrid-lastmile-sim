@@ -1,0 +1,49 @@
+{
+  "experiment_name": "barcelona_m6_smoke",
+  "city": "barcelona",
+  "models": [
+    "M6"
+  ],
+  "zones": [],
+  "demand_scenario": [
+    "high"
+  ],
+  "instance_size": [
+    100
+  ],
+  "demand_seed": [
+    42
+  ],
+  "choice": {
+    "seed": [
+      42,
+      101
+    ],
+    "baseline_pudo_probability": 0.4,
+    "distance_penalty_per_km": 1.0,
+    "max_walking_distance_m": 2000
+  },
+  "facility_filter": {
+    "enabled": false,
+    "initial_buffer_m": 500,
+    "buffer_increment_m": 500,
+    "maximum_buffer_m": 9000,
+    "minimum_candidates": 5
+  },
+  "microhub_coverage_radius_m": 3000,
+  "supply_routing": {
+    "max_route_duration_min": 480,
+    "routing": {
+      "algorithm": "ils",
+      "ils_random_seed": 42,
+      "ils_max_iterations": 100,
+      "ils_max_iterations_without_improvement": 20
+    },
+    "traffic": {},
+    "show_progress": false
+  },
+  "spatial_candidates": {
+    "enabled": true,
+    "block_size": 25
+  }
+}

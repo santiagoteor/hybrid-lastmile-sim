@@ -1,0 +1,8 @@
+modelo,costo_km,costo_hora,v_media,co2_km,nox_km,capacidad,fijo_hub_dia,comision_microhub,comision_pudo,co2_km_estimado_cliente,nox_km_estimado_cliente
+FURGONETA_CONV,0.45,18.0,22.0,242.165,0.142,300.0,,,,,
+FURGONETA_ELEC,0.2,18.0,20.0,0.0,0.0,300.0,,,,,
+BICICLETA_CARGO,0.05,14.0,14.0,0.0,,60.0,45.0,0.7,,,
+PUDO_A_PIE,0.0,12.0,4.5,0.0,,20.0,,,0.5,,
+PUDO_CONSUMIDOR,,,,,,,,,0.5,0.0,
+MICROHUB,,,,,,1500.0,,,,,
+PUDO,,,,,,1500.0,,,,,

@@ -1,0 +1,27 @@
+﻿parameter,category,unit,value,description,status
+conventional_van_cost_per_km,variable_opex,EUR/km,0.25,Aggregate cost per km: diesel 0.12 + depreciation 0.07 + insurance and maintenance 0.06,validated
+conventional_van_labor_cost_per_hour,variable_opex,EUR/hour,12,Labour cost for conventional-van route time,validated
+electric_van_cost_per_km,variable_opex,EUR/km,0.3,Aggregate cost per km: electricity 0.02 + depreciation 0.21 + insurance and maintenance 0.07,validated
+electric_van_labor_cost_per_hour,variable_opex,EUR/hour,12,Labour cost for electric-van route time,validated
+cargo_bike_cost_per_km,variable_opex,EUR/km,0.42,Aggregate cost per km: electricity 0.02 + depreciation 0.20 + insurance and maintenance 0.20,validated
+cargo_bike_labor_cost_per_hour,variable_opex,EUR/hour,12,Cargo-bike rider labour cost,validated
+walking_cost_per_km,variable_opex,EUR/km,0,No distance-related operating cost for walking delivery,validated
+walking_labor_cost_per_hour,variable_opex,EUR/hour,12,Walking courier labour cost,validated
+microhub_commission_per_package,variable_opex,EUR/package,0.28,Microhub OPEX per package: rent 0.07 + insurance personnel services and IT 0.21,validated
+pudo_commission_per_package,variable_opex,EUR/package,0.35,Third-party PUDO or locker service fee per package,validated
+microhub_fixed_cost_per_day,fixed_opex,EUR/facility-day,0,Excluded to avoid double counting because microhub OPEX is included per package,excluded
+pudo_fixed_cost_per_day,fixed_opex,EUR/facility-day,0,Excluded because third-party PUDO costs are represented by the per-package fee,excluded
+warehouse_fixed_cost_per_day,fixed_opex,EUR/day,0,Not included in the current cost boundary,pending
+warehouse_handling_cost_per_package,variable_opex,EUR/package,0,Not included in the current cost boundary,pending
+conventional_van_fixed_cost_per_route,fixed_opex,EUR/route,0,Included in aggregate per-km cost or excluded to avoid double counting,excluded
+electric_van_fixed_cost_per_route,fixed_opex,EUR/route,0,Included in aggregate per-km cost or excluded to avoid double counting,excluded
+cargo_bike_fixed_cost_per_route,fixed_opex,EUR/route,0,Included in aggregate per-km cost or excluded to avoid double counting,excluded
+walking_courier_fixed_cost_per_route,fixed_opex,EUR/route,0,No separate fixed route cost in the current model,excluded
+microhub_capex_allocation_per_day,capex_allocation,EUR/facility-day,0,Excluded because microhub cost is represented as OPEX per package,excluded
+pudo_capex_allocation_per_day,capex_allocation,EUR/facility-day,0,Excluded because third-party PUDO service is represented by the per-package fee,excluded
+conventional_van_capex_allocation_per_route,capex_allocation,EUR/route,0,Depreciation is already included in conventional_van_cost_per_km,excluded
+electric_van_capex_allocation_per_route,capex_allocation,EUR/route,0,Depreciation is already included in electric_van_cost_per_km,excluded
+cargo_bike_capex_allocation_per_route,capex_allocation,EUR/route,0,Depreciation is already included in cargo_bike_cost_per_km,excluded
+walking_courier_capex_allocation_per_route,capex_allocation,EUR/route,0,No walking-equipment CAPEX allocation in the current model,excluded
+customer_time_cost_per_hour,external_cost,EUR/hour,0,Customer collection time is reported but not monetised,excluded
+carbon_cost_per_kg,external_cost,EUR/kgCO2,0,Transport emissions are reported but not monetised,excluded

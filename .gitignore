@@ -1,13 +1,34 @@
+```gitignore
+# Entornos virtuales
 .venv/
+venv/
+
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
 *.egg-info/
-build/
-dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-results/*
-!results/.gitkeep
+# Resultados y cachés
+results/
+.glims_cache/
+.cache/
 
-.env
+# Datos locales pesados
+data/osrm/
+*.osm.pbf
+*.osrm
+*.osrm.*
+
+# Archivos temporales
+*.log
+.DS_Store
+Thumbs.db
+
+# Configuración local de infraestructura
+config/infrastructure.json
+```
+
+others/

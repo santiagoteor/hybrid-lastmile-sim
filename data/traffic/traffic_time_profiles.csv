@@ -1,0 +1,8 @@
+profile,city,day_of_week,start_time,end_time,multiplier,source
+weekday_schedule,all,weekday,00:00,07:00,1.00,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekday,07:00,10:00,1.30,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekday,10:00,13:00,1.10,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekday,13:00,16:00,1.15,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekday,16:00,19:00,1.30,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekday,19:00,00:00,1.05,synthetic_profile_replace_with_observed_or_predicted_data
+weekday_schedule,all,weekend,00:00,00:00,1.00,synthetic_profile_replace_with_observed_or_predicted_data

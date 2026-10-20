@@ -1,0 +1,4 @@
+profile,city,duration_multiplier,source
+baseline,all,1.00,baseline_osrm
+moderate_congestion,all,1.15,scenario_assumption_replace_with_calibrated_data
+high_congestion,all,1.30,scenario_assumption_replace_with_calibrated_data
