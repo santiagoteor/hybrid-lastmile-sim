@@ -18,6 +18,7 @@ from hybrid_lastmile.simulation.engine import simulate
 from hybrid_lastmile.workflow.operational_inputs import export_operational_inputs
 from hybrid_lastmile.workflow.supply import prepare_pudo_supply, prepare_microhub_supply
 from hybrid_lastmile.workflow.supply_routing import plan_pudo_supply, plan_microhub_supply
+from hybrid_lastmile.workflow.supply_accessibility import inaccessible_supply_facilities
 from hybrid_lastmile.workflow.results import export_run_results
 from hybrid_lastmile.workflow.results_adapter import export_glims_metrics, export_glims_summary
 from hybrid_lastmile.workflow.result_audit import export_route_audit
@@ -139,6 +140,7 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
     city_root = data_root / 'locations' / city
     sites = load_all_sites(city_root / 'facilities' / 'records_classified.csv')
     sites = _filter_facilities_for_zones(sites, city_root, zones, cfg.get('facility_filter', {}))
+    original_sites = sites
     choice = cfg['choice']
     parameters = load_glims_parameters(data_root)
     if 'physical_parameters' in cfg:
@@ -179,7 +181,45 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
             suffix += 1
         output.mkdir(parents=True, exist_ok=False)
         reset_osrm_cache_stats()
-        allocations, summary = simulate(customers, sites, network, scenario)
+        # Iteratively remove supply-inaccessible facilities *before* finalizing
+        # customer assignments. Each iteration uses the same random seed.
+        # No customer or package is dropped; GLIMS's conservative OSRM sanitizer
+        # still raises if sparse invalid relations remain.
+        eligible_sites = {kind: list(values) for kind, values in original_sites.items()}
+        accessibility_exclusions = []
+        max_rounds = len(eligible_sites['PUDO']) + len(eligible_sites['MICROHUB']) + 1
+        for _ in range(max_rounds):
+            if not eligible_sites['PUDO']:
+                raise ValueError('No driving-accessible PUDO candidates remain; cannot preserve M6 choice model')
+            allocations, summary = simulate(customers, eligible_sites, network, scenario)
+            prepare_pudo_supply(output, eligible_sites, allocations, parameters.capacities['van_capacity'], city)
+            prepare_microhub_supply(output, eligible_sites, allocations, parameters.capacities['van_capacity'], city)
+            excluded_by_type = {
+                'PUDO': inaccessible_supply_facilities(output, city, folder_name='supply'),
+                'MICROHUB': inaccessible_supply_facilities(output, city, folder_name='microhub_supply'),
+            }
+            if not any(excluded_by_type.values()):
+                break
+            for kind, excluded_ids in excluded_by_type.items():
+                excluded_set = set(excluded_ids)
+                if not excluded_set:
+                    continue
+                for site in eligible_sites[kind]:
+                    if site.site_id in excluded_set:
+                        accessibility_exclusions.append({
+                            'facility_type': kind, 'facility_id': site.site_id,
+                            'latitude': site.latitude, 'longitude': site.longitude,
+                            'reason': 'osrm_driving_strongly_disconnected',
+                            'iteration': len(accessibility_exclusions) + 1,
+                        })
+                eligible_sites[kind] = [s for s in eligible_sites[kind] if s.site_id not in excluded_set]
+        else:
+            raise RuntimeError('Facility accessibility preflight did not converge')
+        if accessibility_exclusions:
+            _write_csv(output / 'audit' / 'excluded_supply_facilities.csv', accessibility_exclusions)
+        summary['excluded_supply_facilities'] = accessibility_exclusions
+        # Downstream exports must reflect the same eligible facility universe.
+        sites = eligible_sites
         operational_manifest = export_operational_inputs(output, customers, sites, allocations, parameters.capacities)
         summary['operational_manifest'] = operational_manifest
         # GLIMS is a required dependency, not a configurable backend.
