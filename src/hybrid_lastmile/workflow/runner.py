@@ -24,7 +24,6 @@ from hybrid_lastmile.workflow.result_audit import export_route_audit
 from hybrid_lastmile.workflow.geography import export_geography
 from hybrid_lastmile.workflow.bike_routing import plan_bike_delivery
 from hybrid_lastmile.workflow.van_routing import plan_van_delivery
-from hybrid_lastmile.workflow.spatial_candidates import CandidateFilter
 from glims.routing.osrm_client import (
     configure_osrm_matrix_cache, get_osrm_cache_stats, reset_osrm_cache_stats,
 )
@@ -152,15 +151,8 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
     run_summaries = []
     batch_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     network = GlimsNetwork(city, block_size)
-    spatial_cfg = cfg.get('spatial_candidates', {})
-    if not isinstance(spatial_cfg, dict):
-        raise ValueError('spatial_candidates must be an object')
-    unknown_spatial = set(spatial_cfg) - {'enabled', 'block_size'}
-    if unknown_spatial:
-        raise ValueError(f'Unknown spatial_candidates settings: {sorted(unknown_spatial)}')
-    candidate_filter = CandidateFilter(network, enabled=spatial_cfg.get('enabled', False),
-                                       block_size=spatial_cfg.get('block_size', block_size))
-    network.rectangular_filtered = candidate_filter.rectangular
+    if 'spatial_candidates' in cfg:
+        raise ValueError('Remove spatial_candidates from the experiment JSON; the experimental filter has been retired.')
     batch_dir = output_root / city / name / batch_timestamp
     batch_dir.mkdir(parents=True, exist_ok=True)
     for demand_scenario, instance_size, demand_seed, choice_seed in itertools.product(
@@ -175,7 +167,7 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
             osrm_cache_directory=str(cache['directory']), **defaults)
         signature = {'city':city, 'demand_scenario':demand_scenario, 'instance_size':instance_size,
             'demand_seed':demand_seed,'choice_seed':choice_seed,'zones':zones,
-            'supply_routing': cfg.get('supply_routing', {}), 'bike_routing': cfg.get('bike_routing', cfg.get('supply_routing', {})), 'van_routing': cfg.get('van_routing', cfg.get('supply_routing', {})), 'supply': cfg.get('supply', {}), 'spatial_candidates': spatial_cfg}
+            'supply_routing': cfg.get('supply_routing', {}), 'bike_routing': cfg.get('bike_routing', cfg.get('supply_routing', {})), 'van_routing': cfg.get('van_routing', cfg.get('supply_routing', {})), 'supply': cfg.get('supply', {})}
         run_id = (f'{demand_scenario}_{instance_size}_dseed{demand_seed}_cseed{choice_seed}_'
                   + str(cfg.get('supply_routing', {}).get('routing', {}).get('algorithm', 'cws')) + '_'
                   + hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:8])
@@ -187,9 +179,7 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
             suffix += 1
         output.mkdir(parents=True, exist_ok=False)
         reset_osrm_cache_stats()
-        candidate_filter.metrics = []
         allocations, summary = simulate(customers, sites, network, scenario)
-        summary['spatial_candidates'] = candidate_filter.export(output)
         operational_manifest = export_operational_inputs(output, customers, sites, allocations, parameters.capacities)
         summary['operational_manifest'] = operational_manifest
         # GLIMS is a required dependency, not a configurable backend.

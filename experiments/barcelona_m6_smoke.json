@@ -9,15 +9,14 @@
     "high"
   ],
   "instance_size": [
-    100
+    1000
   ],
   "demand_seed": [
     42
   ],
   "choice": {
     "seed": [
-      42,
-      101
+      42
     ],
     "baseline_pudo_probability": 0.4,
     "distance_penalty_per_km": 1.0,
@@ -41,9 +40,5 @@
     },
     "traffic": {},
     "show_progress": false
-  },
-  "spatial_candidates": {
-    "enabled": true,
-    "block_size": 25
   }
 }

@@ -30,8 +30,25 @@ def _ordered_candidates(row, sites, remaining, packages, max_distance):
     return sorted(choices)
 
 
+# Bound peak matrix memory without changing GLIMS/OSRM routing or candidate rules.
+# A multiple of common OSRM block sizes avoids unnecessarily tiny requests.
+_MATRIX_SOURCE_BATCH = 1000
+
+def _distance_rows_only(origins, destinations, network, mode):
+    """Yield distance rows in original order, using bounded rectangular matrices."""
+    for start in range(0, len(origins), _MATRIX_SOURCE_BATCH):
+        batch = origins[start:start + _MATRIX_SOURCE_BATCH]
+        matrix = network.rectangular(batch, destinations, mode).distances_m
+        if matrix.shape != (len(batch), len(destinations)):
+            raise ValueError(f"Invalid {mode} matrix shape: {matrix.shape}")
+        yield from matrix
+
+def _distance_rows(origins, destinations, network, mode):
+    return zip(origins, _distance_rows_only(origins, destinations, network, mode))
+
+
 def simulate(customers, sites, network, scenario: Scenario):
-    """Return (allocations, summary); full rectangular matrices, no haversine shortlist.
+    """Return (allocations, summary); exact OSRM matrices in bounded source batches.
 
     Choices are sampled once per customer; if a chosen PUDO fills, next feasible
     PUDO is considered. HD is assigned to a microhub only within cycling coverage.
@@ -45,15 +62,12 @@ def simulate(customers, sites, network, scenario: Scenario):
     microhubs = sorted(sites['MICROHUB'], key=lambda s:s.site_id)
     if not pudos:
         raise ValueError('No PUDO candidates')
-    walking = network.rectangular_filtered(customers,pudos,'walking',scenario.max_walking_distance_m).distances_m if hasattr(network, 'rectangular_filtered') else network.rectangular(customers,pudos,'walking').distances_m
-    if walking.shape != (len(customers),len(pudos)):
-        raise ValueError('Invalid walking matrix shape')
     rng = Random(scenario.seed)
     pudo_remaining = {p.site_id:scenario.pudo_capacity for p in pudos}
     allocations = []
     hd_customers = []
-    for i,customer in enumerate(customers):
-        options = _ordered_candidates(walking[i],pudos,pudo_remaining,customer.packages,scenario.max_walking_distance_m)
+    for customer, walking_row in _distance_rows(customers, pudos, network, "walking"):
+        options = _ordered_candidates(walking_row,pudos,pudo_remaining,customer.packages,scenario.max_walking_distance_m)
         if options:
             dist, facility = options[0]
             p = probability(dist,scenario)
@@ -66,11 +80,8 @@ def simulate(customers, sites, network, scenario: Scenario):
         hd_customers.append((customer,p))
     micro_remaining = {m.site_id:scenario.microhub_capacity for m in microhubs}
     hd_only = [customer for customer,_ in hd_customers]
-    cycling = network.rectangular_filtered(hd_only,microhubs,'cycling',scenario.microhub_max_cycling_distance_m).distances_m if hasattr(network, 'rectangular_filtered') else network.rectangular(hd_only,microhubs,'cycling').distances_m
-    if cycling.shape != (len(hd_only),len(microhubs)):
-        raise ValueError('Invalid cycling matrix shape')
-    for i,(customer,p) in enumerate(hd_customers):
-        options = _ordered_candidates(cycling[i],microhubs,micro_remaining,customer.packages,scenario.microhub_max_cycling_distance_m)
+    for (customer,p), cycling_row in zip(hd_customers, _distance_rows_only(hd_only, microhubs, network, "cycling")):
+        options = _ordered_candidates(cycling_row,microhubs,micro_remaining,customer.packages,scenario.microhub_max_cycling_distance_m)
         if options:
             distance,facility = options[0]
             micro_remaining[facility] -= customer.packages
