@@ -9,7 +9,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
-SCHEMAS = {'routes/m5_routes.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'vehicle_type', 'depot', 'route_number', 'stop_count', 'package_load', 'vehicle_capacity', 'distance_km', 'network_distance_km', 'last_meter_access_distance_km', 'system_distance_km', 'duration_min', 'start_handling_min', 'base_stop_service_min', 'last_meter_access_time_min', 'stop_service_min', 'routing_algorithm', 'cws_allow_route_reversal', 'traffic_profile', 'traffic_duration_multiplier', 'traffic_source', 'time_traffic_profile', 'simulation_date', 'shift_start_time', 'shift_end_time', 'route_start_datetime', 'route_end_datetime', 'base_travel_time_min', 'time_dependent_travel_time_min', 'traffic_delay_min', 'shift_feasible', 'stop_sequence', 'geometry_wkt', 'supply_vehicle_type', 'network_duration_min', 'experiment_id', 'selected_traffic_profile'], 'routes/route_stops.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'route_number', 'vehicle_type', 'supply_vehicle_type', 'depot', 'stop_position', 'stop_type', 'stop_id', 'latitude', 'longitude', 'package_load', 'snap_distance_m', 'last_meter_access_distance_m', 'last_meter_access_time_min', 'base_service_time_min', 'effective_service_time_min', 'arrival_datetime', 'service_start_datetime', 'service_end_datetime', 'experiment_id'], 'audit/routing_integrity_summary.csv': ['city', 'neighborhood', 'model', 'leg', 'input_customers', 'excluded_unroutable_customers', 'expected_routable_customers', 'assigned_unique_customers', 'assigned_customer_occurrences', 'unassigned_customers', 'duplicated_customers', 'unexpected_customer_ids', 'input_packages', 'excluded_unroutable_packages', 'expected_routable_packages', 'assigned_package_occurrences', 'customer_balance_ok', 'package_balance_ok', 'audit_status', 'missing_customer_ids', 'duplicated_customer_ids', 'unexpected_customer_id_values', 'experiment_id', 'routing_algorithm'], 'audit/route_customer_summary.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'route_number', 'customer_count', 'unique_customer_count', 'duplicate_customer_occurrences', 'package_count', 'experiment_id', 'routing_algorithm'], 'audit/unroutable_customers.csv': ['experiment_id', 'routing_algorithm']}
+SCHEMAS = {'routes/m5_routes.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'vehicle_type', 'depot', 'route_number', 'stop_count', 'package_load', 'vehicle_capacity', 'distance_km', 'network_distance_km', 'last_meter_access_distance_km', 'system_distance_km', 'duration_min', 'start_handling_min', 'base_stop_service_min', 'last_meter_access_time_min', 'stop_service_min', 'routing_algorithm', 'cws_allow_route_reversal', 'traffic_profile', 'traffic_duration_multiplier', 'traffic_source', 'time_traffic_profile', 'simulation_date', 'shift_start_time', 'shift_end_time', 'route_start_datetime', 'route_end_datetime', 'base_travel_time_min', 'time_dependent_travel_time_min', 'traffic_delay_min', 'shift_feasible', 'stop_sequence', 'geometry_wkt', 'supply_vehicle_type', 'network_duration_min', 'experiment_id', 'selected_traffic_profile'], 'routes/route_stops.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'route_number', 'vehicle_type', 'supply_vehicle_type', 'depot', 'stop_position', 'stop_type', 'stop_id', 'latitude', 'longitude', 'package_load', 'snap_distance_m', 'last_meter_access_distance_m', 'last_meter_access_time_min', 'base_service_time_min', 'effective_service_time_min', 'arrival_datetime', 'service_start_datetime', 'service_end_datetime', 'experiment_id'], 'audit/routing_integrity_summary.csv': ['city', 'neighborhood', 'model', 'leg', 'input_customers', 'excluded_unroutable_customers', 'expected_routable_customers', 'assigned_unique_customers', 'assigned_customer_occurrences', 'unassigned_customers', 'duplicated_customers', 'unexpected_customer_ids', 'input_packages', 'excluded_unroutable_packages', 'expected_routable_packages', 'assigned_package_occurrences', 'customer_balance_ok', 'package_balance_ok', 'audit_status', 'missing_customer_ids', 'duplicated_customer_ids', 'unexpected_customer_id_values', 'experiment_id', 'routing_algorithm'], 'audit/route_customer_summary.csv': ['city', 'neighborhood', 'model', 'leg', 'route_id', 'route_number', 'customer_count', 'unique_customer_count', 'duplicate_customer_occurrences', 'package_count', 'experiment_id', 'routing_algorithm'], 'audit/unroutable_customers.csv': ['city', 'model', 'leg', 'experiment_id', 'routing_algorithm', 'customer_id', 'latitude', 'longitude', 'packages', 'reason', 'origin_id', 'supply_visit']}
 OPERATIONS = (
     ('supply', 'pudo_supply', 'conventional_van', 'PUDO'),
     ('microhub_supply', 'microhub_supply', 'conventional_van', 'MICROHUB'),
@@ -58,6 +58,20 @@ def export_route_audit(run_dir, summary, allocations, capacities):
         customer_leg = stop_type == 'HOME'
         expected_customers = len(selected) if customer_leg else 0
         expected_ids = {str(a.customer_id) for a in selected} if customer_leg else set()
+        excluded_visits = _read(source / 'unroutable_visits.csv') if customer_leg else []
+        excluded_ids = {str(v['customer_id']) for v in excluded_visits}
+        if excluded_visits and leg != 'van_delivery':
+            raise ValueError(f'{leg}: unexpected exclusions outside VAN')
+        if len(excluded_ids) != len(excluded_visits):
+            raise ValueError(f'{leg}: duplicate excluded customer visits; review split visits')
+        excluded_packages = sum(_number(v['packages']) for v in excluded_visits)
+        if excluded_ids - expected_ids:
+            raise ValueError(f'{leg}: exclusions not present in assigned demand')
+        for v in excluded_visits:
+            unroutable.append(dict(**base, leg=leg, routing_algorithm=metadata.get('routing_algorithm'),
+                customer_id=v['customer_id'], latitude=v['latitude'], longitude=v['longitude'],
+                packages=v['packages'], reason=v['reason'], origin_id=v['origin_id'],
+                supply_visit=v['supply_visit']))
         stop_by_route = defaultdict(list)
         if customer_leg:
             for item in home_stops:
@@ -117,19 +131,19 @@ def export_route_audit(run_dir, summary, allocations, capacities):
                     customer_count=len(ids), unique_customer_count=len(set(ids)),
                     duplicate_customer_occurrences=len(ids)-len(set(ids)), package_count=load,
                     routing_algorithm=metadata.get('routing_algorithm')))
-        missing = sorted(expected_ids - set(seen))
+        missing = sorted(expected_ids - set(seen) - excluded_ids)
         unexpected = sorted(set(seen) - expected_ids)
         duplicates = sorted(k for k,v in seen.items() if v>1)
-        package_ok = abs(assigned_packages-expected_packages)<1e-6
-        customer_ok = (not missing and not unexpected and not duplicates) if customer_leg else True
+        package_ok = abs(assigned_packages + excluded_packages - expected_packages)<1e-6
+        customer_ok = (not missing and not unexpected and not duplicates and not (excluded_ids & set(seen))) if customer_leg else True
         status = 'OK' if customer_ok and package_ok else 'FAIL'
         audit_rows.append(dict(**base, leg=leg, input_customers=expected_customers,
-            excluded_unroutable_customers=0, expected_routable_customers=expected_customers,
+            excluded_unroutable_customers=len(excluded_ids), expected_routable_customers=expected_customers-len(excluded_ids),
             assigned_unique_customers=len(seen) if customer_leg else 0,
             assigned_customer_occurrences=sum(seen.values()) if customer_leg else 0,
             unassigned_customers=len(missing), duplicated_customers=len(duplicates),
             unexpected_customer_ids=len(unexpected), input_packages=expected_packages,
-            excluded_unroutable_packages=0, expected_routable_packages=expected_packages,
+            excluded_unroutable_packages=excluded_packages, expected_routable_packages=expected_packages-excluded_packages,
             assigned_package_occurrences=assigned_packages, customer_balance_ok=customer_ok,
             package_balance_ok=package_ok, audit_status=status,
             missing_customer_ids=';'.join(missing), duplicated_customer_ids=';'.join(duplicates),

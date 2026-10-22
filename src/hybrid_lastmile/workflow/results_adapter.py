@@ -43,6 +43,8 @@ def export_glims_metrics(run_dir, summary, allocations, parameters):
         packages = (summary['packages_by_mode'].get('PUDO', 0) if leg == 'PUDO_SUPPLY'
                     else summary['packages_by_mode'].get('CARGO_BIKE', 0) if leg == 'MICROHUB_SUPPLY'
                     else summary['packages_by_mode'].get(leg, 0))
+        if leg == 'VAN':
+            packages -= float(metrics.get('unroutable_package_count', 0))
         if routes == 0 and packages:
             raise ValueError(f'{leg}: {packages} packages but no routes')
         if model_name not in model_table.index:

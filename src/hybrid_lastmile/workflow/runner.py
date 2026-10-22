@@ -255,6 +255,11 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
         summary['van_routing'] = plan_van_delivery(
             output, city, customers, sites, allocations, parameters.capacities['van_capacity'],
             cfg.get('van_routing', route_cfg))
+        # Assigned demand is conserved; VAN exclusions are explicitly unserved.
+        summary['unroutable_van_customers'] = summary['van_routing']['unroutable_customer_count']
+        summary['unroutable_van_packages'] = summary['van_routing']['unroutable_package_count']
+        summary['served_packages'] = (sum(summary['packages_by_mode'].values())
+                                      - summary['unroutable_van_packages'])
         summary['run_id'] = output.name
         summary['scenario_id'] = run_id
         summary['demand_scenario'] = demand_scenario

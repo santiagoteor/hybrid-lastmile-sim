@@ -25,7 +25,7 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
         raise ValueError(f'Unknown GLIMS routing options: {sorted(unknown)}')
     cfg = RoutingAlgorithmConfig(**options)
     router = CapacityAwareOsrmRouter(city)
-    route_rows, stop_rows, totals = [], [], {'route_count': 0, 'total_distance_km': 0.0, 'total_duration_min': 0.0, 'packages': 0.0, 'unroutable_customer_count': 0, 'unroutable_package_count': 0.0, 'route_start_time_per_route_min': None}
+    route_rows, stop_rows, excluded_rows, totals = [], [], [] , {'route_count': 0, 'total_distance_km': 0.0, 'total_duration_min': 0.0, 'packages': 0.0, 'unroutable_customer_count': 0, 'unroutable_package_count': 0.0, 'route_start_time_per_route_min': None}
     for hub_id, group in sorted(groups.items()):
         hub = hub_map[hub_id]
         original = pd.DataFrame([{'Location': a.customer_id, 'Latitude': customer_map[a.customer_id].latitude,
@@ -54,18 +54,35 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
             ils_relocate_neighbor_routes=cfg.ils_relocate_neighbor_routes,
             ils_relocate_max_insertions=cfg.ils_relocate_max_insertions,
             ils_random_seed=cfg.ils_random_seed,
-            show_progress=bool(settings.get('show_progress', False)))
-        if plan.unroutable_customer_count or plan.unroutable_package_count:
+            show_progress=bool(settings.get('show_progress', False)),
+            exclude_unroutable_clients=(mode == 'VAN'))
+        if mode != 'VAN' and (plan.unroutable_customer_count or plan.unroutable_package_count):
             raise ValueError(f'Unroutable {mode} visits for depot {hub_id}')
+        excluded_positions = list(plan.unroutable_client_positions)
+        if len(set(excluded_positions)) != len(excluded_positions) or any(
+            not 0 <= int(i) < len(visits) for i in excluded_positions
+        ):
+            raise AssertionError('Invalid GLIMS unroutable visit positions')
+        excluded_set = set(excluded_positions)
+        routed_visits = visits.iloc[[i for i in range(len(visits)) if i not in excluded_set]].reset_index(drop=True)
+        for i in excluded_positions:
+            v = visits.iloc[int(i)]
+            excluded_rows.append({'leg': folder_name, 'origin_id': hub_id,
+                                  'customer_id': str(v.Location), 'latitude': v.Latitude,
+                                  'longitude': v.Longitude, 'packages': float(v.Demand),
+                                  'supply_visit': int(v.SupplyVisit), 'reason': 'osrm_unroutable'})
+        if abs(sum(row['packages'] for row in excluded_rows if row['origin_id'] == hub_id)
+               - float(plan.unroutable_package_count)) > 1e-6:
+            raise AssertionError('GLIMS excluded package total mismatch')
         seen = [int(idx) for route in plan.routes for idx in route]
-        if sorted(seen) != list(range(1, len(visits) + 1)):
+        if sorted(seen) != list(range(1, len(routed_visits) + 1)):
             raise AssertionError(f'GLIMS {mode} routes do not cover all visits at {hub_id}')
         for n, (route, km, minutes, load) in enumerate(zip(plan.routes, plan.route_distances_km, plan.route_durations_min, plan.route_loads), 1):
             rid = f'{prefix}_{hub_id}_{n}'
             route_rows.append({'route_id': rid, 'microhub_id': hub_id, 'vehicle_type': vehicle_type, 'distance_km': km,
                                'duration_min': minutes, 'packages': load, 'stop_indices_json': json.dumps(route)})
             for pos, idx in enumerate(route, 1):
-                v = visits.iloc[int(idx)-1]
+                v = routed_visits.iloc[int(idx)-1]
                 stop_rows.append({'leg': folder_name, 'route_id': rid, 'route_number': n, 'vehicle_type': vehicle_type,
                                   'origin_id': hub_id, 'stop_position': pos, 'stop_type': 'HOME',
                                   'stop_id': str(v.Location), 'latitude': v.Latitude, 'longitude': v.Longitude,
@@ -77,13 +94,14 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
         totals['route_count'] += int(plan.route_count)
         totals['total_distance_km'] += float(plan.total_distance_km)
         totals['total_duration_min'] += float(plan.total_duration_min)
-        totals['packages'] += float(visits.Demand.sum())
+        totals['packages'] += float(routed_visits.Demand.sum())
         totals['unroutable_customer_count'] += int(plan.unroutable_customer_count)
         totals['unroutable_package_count'] += float(plan.unroutable_package_count)
+    pd.DataFrame(excluded_rows, columns=['leg','origin_id','customer_id','latitude','longitude','packages','supply_visit','reason']).to_csv(folder/'unroutable_visits.csv', index=False)
     pd.DataFrame(route_rows, columns=['route_id','microhub_id','vehicle_type','distance_km','duration_min','packages','stop_indices_json']).to_csv(folder/'routes.csv', index=False)
     pd.DataFrame(stop_rows, columns=['leg','route_id','route_number','vehicle_type','origin_id','stop_position','stop_type','stop_id','latitude','longitude','package_load','supply_visit']).to_csv(folder/'route_stops.csv', index=False)
     expected = sum(a.packages for a in allocations if a.delivery_mode == mode)
-    if abs(totals['packages'] - expected) > 1e-6:
+    if abs(totals['packages'] + totals['unroutable_package_count'] - expected) > 1e-6:
         raise AssertionError(f'{mode} routes did not conserve assigned parcels')
     result = {'status': 'planned' if groups else 'not_required', 'routing_algorithm': cfg.algorithm, 'depot_count': len(groups), **totals}
     (folder/'route_summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
