@@ -5,7 +5,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def export_operational_inputs(output_dir, customers, sites, allocations, capacities):
+def export_operational_inputs(output_dir, customers, sites, allocations, capacities, warehouse_assignments=None):
     """Write stop manifests and capacity lower bounds, preserving all package counts.
 
     These manifests are *inputs* to GLIMS routing, not optimized routes.
@@ -42,13 +42,14 @@ def export_operational_inputs(output_dir, customers, sites, allocations, capacit
             operation = 'CC_TO_PUDO'
         else:
             raise ValueError(f'Unknown mode {a.delivery_mode}')
-        records.append({'operation': operation, 'origin_id': origin, 'destination_id': destination_id,
+        warehouse_id = warehouse_assignments[a.customer_id][0] if warehouse_assignments is not None else ''
+        records.append({'operation': operation, 'origin_id': origin, 'warehouse_id': warehouse_id, 'destination_id': destination_id,
                         'customer_id': a.customer_id, 'latitude': latitude, 'longitude': longitude,
                         'packages': a.packages})
         grouped[(operation, origin)]['packages'] += a.packages
         grouped[(operation, origin)]['stops'] += 1
     with (root / 'stop_manifest.csv').open('w', encoding='utf-8', newline='') as fh:
-        writer = csv.DictWriter(fh, fieldnames=['operation','origin_id','destination_id','customer_id','latitude','longitude','packages'])
+        writer = csv.DictWriter(fh, fieldnames=['operation','origin_id','warehouse_id','destination_id','customer_id','latitude','longitude','packages'])
         writer.writeheader()
         writer.writerows(records)
     from math import ceil

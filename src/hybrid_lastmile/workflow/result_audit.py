@@ -151,6 +151,32 @@ def export_route_audit(run_dir, summary, allocations, capacities):
             routing_algorithm=metadata.get('routing_algorithm')))
         if status != 'OK':
             raise ValueError(f'{leg}: route integrity audit failed: missing={missing}, duplicates={duplicates}, unexpected={unexpected}, packages={assigned_packages}/{expected_packages}')
+    # Enrich the established GLIMS-compatible exports without changing their schema.
+    route_timing = {(r['leg'], str(r['route_id'])): r for r in
+                    _read(run_dir / 'routes' / 'operating_route_timeline.csv')}
+    stop_timing = {(r['leg'], str(r['route_id']), str(r['stop_position'])): r for r in
+                   _read(run_dir / 'routes' / 'operating_stop_timeline.csv')}
+    for row in route_rows:
+        original_id = row['route_number']
+        leg_folder = {'pudo_supply': 'supply', 'microhub_supply': 'microhub_supply',
+                      'bike_delivery': 'bike_delivery', 'van_delivery': 'van_delivery'}[row['leg']]
+        record = route_timing.get((leg_folder, str(original_id)))
+        if record:
+            for key in ('simulation_date', 'shift_start_time', 'shift_end_time',
+                        'route_start_datetime', 'route_end_datetime', 'base_travel_time_min',
+                        'time_dependent_travel_time_min', 'traffic_delay_min', 'shift_feasible',
+                        'traffic_source'):
+                row[key] = record[key]
+    for row in stop_rows:
+        original_id = row['route_number']
+        leg_folder = {'pudo_supply': 'supply', 'microhub_supply': 'microhub_supply',
+                      'bike_delivery': 'bike_delivery', 'van_delivery': 'van_delivery'}[row['leg']]
+        record = stop_timing.get((leg_folder, str(original_id), str(row['stop_position'])))
+        if record:
+            for key in ('arrival_datetime', 'service_start_datetime',
+                        'service_end_datetime', 'base_service_time_min',
+                        'effective_service_time_min'):
+                row[key] = record[key]
     _write(run_dir/'routes'/'m6_routes.csv',route_rows,SCHEMAS['routes/m5_routes.csv'])
     _write(run_dir/'routes'/'route_stops.csv',stop_rows,SCHEMAS['routes/route_stops.csv'])
     _write(run_dir/'audit'/'routing_integrity_summary.csv',audit_rows,SCHEMAS['audit/routing_integrity_summary.csv'])

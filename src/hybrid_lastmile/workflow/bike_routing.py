@@ -25,7 +25,7 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
         raise ValueError(f'Unknown GLIMS routing options: {sorted(unknown)}')
     cfg = RoutingAlgorithmConfig(**options)
     router = CapacityAwareOsrmRouter(city)
-    route_rows, stop_rows, excluded_rows, totals = [], [], [] , {'route_count': 0, 'total_distance_km': 0.0, 'total_duration_min': 0.0, 'packages': 0.0, 'unroutable_customer_count': 0, 'unroutable_package_count': 0.0, 'route_start_time_per_route_min': None}
+    route_rows, stop_rows, excluded_rows, totals = [], [], [] , {'route_count': 0, 'total_distance_km': 0.0, 'total_duration_min': 0.0, 'packages': 0.0, 'unroutable_customer_count': 0, 'unroutable_package_count': 0.0, 'route_start_time_per_route_min': None, 'cws_initial_distance_km': 0.0, 'cws_runtime_seconds': 0.0, 'routing_runtime_seconds': 0.0}
     for hub_id, group in sorted(groups.items()):
         hub = hub_map[hub_id]
         original = pd.DataFrame([{'Location': a.customer_id, 'Latitude': customer_map[a.customer_id].latitude,
@@ -91,6 +91,9 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
             totals['route_start_time_per_route_min'] = float(plan.route_start_time_per_route_min)
         elif totals['route_start_time_per_route_min'] != float(plan.route_start_time_per_route_min):
             raise ValueError('Inconsistent GLIMS route preparation times across depots')
+        totals['cws_initial_distance_km'] += float(plan.cws_initial_distance_km)
+        totals['cws_runtime_seconds'] += float(plan.cws_runtime_seconds)
+        totals['routing_runtime_seconds'] += float(plan.routing_runtime_seconds)
         totals['route_count'] += int(plan.route_count)
         totals['total_distance_km'] += float(plan.total_distance_km)
         totals['total_duration_min'] += float(plan.total_duration_min)
@@ -103,6 +106,8 @@ def plan_home_delivery(run_dir, city, customers, allocations, capacity, settings
     expected = sum(a.packages for a in allocations if a.delivery_mode == mode)
     if abs(totals['packages'] + totals['unroutable_package_count'] - expected) > 1e-6:
         raise AssertionError(f'{mode} routes did not conserve assigned parcels')
+    totals['ils_improvement_distance_km'] = max(0.0, totals['cws_initial_distance_km'] - totals['total_distance_km']) if groups else 0.0
+    totals['ils_improvement_percent'] = (100.0 * totals['ils_improvement_distance_km'] / totals['cws_initial_distance_km'] if totals['cws_initial_distance_km'] > 0 else 0.0)
     result = {'status': 'planned' if groups else 'not_required', 'routing_algorithm': cfg.algorithm, 'depot_count': len(groups), **totals}
     (folder/'route_summary.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
     return result

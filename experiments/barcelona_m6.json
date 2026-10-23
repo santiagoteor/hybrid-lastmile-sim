@@ -40,5 +40,20 @@
     },
     "traffic": {},
     "show_progress": false
+  },
+  "warehouses": [
+    "BAR_LOC_001532",
+    "BAR_LOC_001522",
+    "BAR_LOC_001556"
+  ],
+  "operating_hours": {
+    "simulation_date": "2026-10-23",
+    "start": "09:00",
+    "end": "17:00",
+    "last_service_margin_minutes": 30,
+    "van_loading_minutes": 15,
+    "truck_loading_minutes": 15,
+    "bike_preparation_minutes": 5,
+    "service_time_per_stop_minutes": 5
   }
 }

@@ -4,6 +4,9 @@ import csv
 import hashlib
 import itertools
 import json
+import time
+import traceback
+from contextlib import contextmanager
 from dataclasses import asdict, replace
 from pathlib import Path
 from datetime import datetime
@@ -25,9 +28,46 @@ from hybrid_lastmile.workflow.result_audit import export_route_audit
 from hybrid_lastmile.workflow.geography import export_geography
 from hybrid_lastmile.workflow.bike_routing import plan_bike_delivery
 from hybrid_lastmile.workflow.van_routing import plan_van_delivery
+from hybrid_lastmile.workflow.warehouses import export_warehouse_assignments, resolve_warehouses
+from hybrid_lastmile.workflow.warehouse_supply import plan_partitioned_supply
+from hybrid_lastmile.workflow.operating_timeline import build_operating_timeline
+from hybrid_lastmile.workflow.schedule_audit import reconcile_schedule_diagnostics
 from glims.routing.osrm_client import (
     configure_osrm_matrix_cache, get_osrm_cache_stats, reset_osrm_cache_stats,
 )
+
+
+@contextmanager
+def _timed_stage(stage_name, records):
+    """Record elapsed wall-clock time without retaining routes or OSRM matrices."""
+    start = datetime.now().astimezone()
+    tick = time.perf_counter()
+    try:
+        yield
+    finally:
+        end = datetime.now().astimezone()
+        elapsed = round(time.perf_counter() - tick, 3)
+        records.append({'stage': stage_name, 'started_at': start.isoformat(timespec='seconds'),
+                        'finished_at': end.isoformat(timespec='seconds'), 'elapsed_seconds': elapsed})
+        print(f'[M6 timing] {stage_name}: {elapsed:.3f} s', flush=True)
+
+def _write_timing(output, records, started_at, tick):
+    finished = datetime.now().astimezone()
+    total = round(time.perf_counter() - tick, 3)
+    timing = {'started_at': started_at.isoformat(timespec='seconds'),
+              'finished_at': finished.isoformat(timespec='seconds'),
+              'elapsed_seconds': total, 'stages': records}
+    (output / 'execution_timing.json').write_text(json.dumps(timing, indent=2), encoding='utf-8')
+    _write_csv(output / 'execution_timing.csv', records)
+    print(f'[M6 timing] total experiment: {total:.3f} s', flush=True)
+    return timing
+
+def _write_batch_status(batch_dir, records):
+    """Write a small, atomic, machine-readable batch progress snapshot."""
+    path = batch_dir / 'batch_status.json'
+    temp = batch_dir / 'batch_status.json.tmp'
+    temp.write_text(json.dumps({'total': len(records), 'runs': records}, indent=2), encoding='utf-8')
+    temp.replace(path)
 
 
 def _read_json(path: Path) -> dict:
@@ -36,6 +76,68 @@ def _read_json(path: Path) -> dict:
 
 def _options(value: Any) -> list:
     return value if isinstance(value, list) else [value]
+
+
+def _experiment_combinations(cfg, choice):
+    """Pair replicate seeds by position, or explicitly request their Cartesian product."""
+    demand_seeds = _options(cfg['demand_seed'])
+    choice_seeds = _options(choice['seed'])
+    mode = cfg.get('seed_pairing', 'paired')
+    if mode == 'paired':
+        if len(demand_seeds) != len(choice_seeds):
+            raise ValueError('seed_pairing=paired requires demand_seed and choice.seed lists of equal length')
+        seeds = list(zip(demand_seeds, choice_seeds))
+    elif mode == 'cartesian':
+        seeds = list(itertools.product(demand_seeds, choice_seeds))
+    else:
+        raise ValueError('seed_pairing must be paired or cartesian')
+    return [(scenario, size, dseed, cseed)
+            for scenario, size in itertools.product(
+                _options(cfg['demand_scenario']), _options(cfg['instance_size']))
+            for dseed, cseed in seeds]
+
+
+def _prepare_accessible_supply(output, city, customers, sites, network, scenario,
+                               van_capacity, stage_records):
+    """Reassign from scratch after removing disconnected PUDO/microhub facilities."""
+    active_sites = {key: list(values) for key, values in sites.items()}
+    excluded = []
+    maximum_rounds = len(active_sites['PUDO']) + len(active_sites['MICROHUB']) + 1
+    for round_index in range(maximum_rounds):
+        with _timed_stage('demand_assignment' if round_index == 0 else 'demand_reassignment', stage_records):
+            allocations, summary = simulate(customers, active_sites, network, scenario)
+        with _timed_stage('pudo_supply_preparation', stage_records):
+            pudo_summary = prepare_pudo_supply(output, active_sites, allocations, van_capacity, city)
+        with _timed_stage('microhub_supply_preparation', stage_records):
+            micro_summary = prepare_microhub_supply(output, active_sites, allocations, van_capacity, city)
+        newly_excluded = []
+        with _timed_stage('supply_accessibility_preflight', stage_records):
+            for facility_type, folder in (('PUDO', 'supply'), ('MICROHUB', 'microhub_supply')):
+                bad_ids = set(inaccessible_supply_facilities(output, city, folder_name=folder))
+                known = {site.site_id for site in active_sites[facility_type]}
+                if not bad_ids <= known:
+                    raise ValueError(f'Unknown excluded {facility_type} IDs: {sorted(bad_ids - known)}')
+                for site in active_sites[facility_type]:
+                    if site.site_id in bad_ids:
+                        newly_excluded.append({'round': round_index + 1,
+                                               'facility_type': facility_type,
+                                               'facility_id': site.site_id,
+                                               'latitude': site.latitude,
+                                               'longitude': site.longitude,
+                                               'reason': 'strongly_disconnected_driving_osrm'})
+                active_sites[facility_type] = [site for site in active_sites[facility_type]
+                                               if site.site_id not in bad_ids]
+        if not newly_excluded:
+            if excluded:
+                _write_csv(output / 'audit' / 'excluded_supply_facilities.csv', excluded)
+            summary['supply_accessibility'] = {'excluded_facility_count': len(excluded),
+                                                'reassignment_rounds': round_index,
+                                                'excluded_facilities_audit': 'audit/excluded_supply_facilities.csv' if excluded else None}
+            return allocations, summary, active_sites, pudo_summary, micro_summary
+        excluded.extend(newly_excluded)
+        print(f'[M6 supply preflight] Excluded {len(newly_excluded)} inaccessible facilities; '
+              f'reassigning all customers (round {round_index + 1})', flush=True)
+    raise RuntimeError('Supply accessibility preflight did not converge')
 
 
 def _select_demand_file(directory: Path, scenario: str, size: int, seed: int) -> Path:
@@ -140,7 +242,6 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
     city_root = data_root / 'locations' / city
     sites = load_all_sites(city_root / 'facilities' / 'records_classified.csv')
     sites = _filter_facilities_for_zones(sites, city_root, zones, cfg.get('facility_filter', {}))
-    original_sites = sites
     choice = cfg['choice']
     parameters = load_glims_parameters(data_root)
     if 'physical_parameters' in cfg:
@@ -157,146 +258,163 @@ def run_experiment(config_path: str | Path, data_root: str | Path, output_root: 
         raise ValueError('Remove spatial_candidates from the experiment JSON; the experimental filter has been retired.')
     batch_dir = output_root / city / name / batch_timestamp
     batch_dir.mkdir(parents=True, exist_ok=True)
-    for demand_scenario, instance_size, demand_seed, choice_seed in itertools.product(
-        _options(cfg['demand_scenario']), _options(cfg['instance_size']),
-        _options(cfg['demand_seed']), _options(choice['seed'])):
-        demand_file = _select_demand_file(city_root/'demand', demand_scenario, int(instance_size), int(demand_seed))
-        customers = _filter_by_zones(load_customers(demand_file), zones)
-        scenario = Scenario(city=city, demand_file=demand_file.name, seed=int(choice_seed),
-            baseline_pudo_probability=float(choice['baseline_pudo_probability']),
-            distance_penalty_per_km=float(choice['distance_penalty_per_km']),
-            osrm_block_size=block_size, osrm_cache_enabled=bool(cache['enabled']),
-            osrm_cache_directory=str(cache['directory']), **defaults)
-        signature = {'city':city, 'demand_scenario':demand_scenario, 'instance_size':instance_size,
-            'demand_seed':demand_seed,'choice_seed':choice_seed,'zones':zones,
-            'supply_routing': cfg.get('supply_routing', {}), 'bike_routing': cfg.get('bike_routing', cfg.get('supply_routing', {})), 'van_routing': cfg.get('van_routing', cfg.get('supply_routing', {})), 'supply': cfg.get('supply', {})}
-        run_id = (f'{demand_scenario}_{instance_size}_dseed{demand_seed}_cseed{choice_seed}_'
-                  + str(cfg.get('supply_routing', {}).get('routing', {}).get('algorithm', 'cws')) + '_'
-                  + hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:8])
-        # One timestamp per experiment batch; individual scenarios are nested inside.
-        output = batch_dir / run_id
-        suffix = 1
-        while output.exists():
-            output = batch_dir / f'{run_id}_{suffix:02d}'
-            suffix += 1
-        output.mkdir(parents=True, exist_ok=False)
-        reset_osrm_cache_stats()
-        # Iteratively remove supply-inaccessible facilities *before* finalizing
-        # customer assignments. Each iteration uses the same random seed.
-        # No customer or package is dropped; GLIMS's conservative OSRM sanitizer
-        # still raises if sparse invalid relations remain.
-        eligible_sites = {kind: list(values) for kind, values in original_sites.items()}
-        accessibility_exclusions = []
-        max_rounds = len(eligible_sites['PUDO']) + len(eligible_sites['MICROHUB']) + 1
-        for _ in range(max_rounds):
-            if not eligible_sites['PUDO']:
-                raise ValueError('No driving-accessible PUDO candidates remain; cannot preserve M6 choice model')
-            allocations, summary = simulate(customers, eligible_sites, network, scenario)
-            prepare_pudo_supply(output, eligible_sites, allocations, parameters.capacities['van_capacity'], city)
-            prepare_microhub_supply(output, eligible_sites, allocations, parameters.capacities['van_capacity'], city)
-            excluded_by_type = {
-                'PUDO': inaccessible_supply_facilities(output, city, folder_name='supply'),
-                'MICROHUB': inaccessible_supply_facilities(output, city, folder_name='microhub_supply'),
-            }
-            if not any(excluded_by_type.values()):
-                break
-            for kind, excluded_ids in excluded_by_type.items():
-                excluded_set = set(excluded_ids)
-                if not excluded_set:
-                    continue
-                for site in eligible_sites[kind]:
-                    if site.site_id in excluded_set:
-                        accessibility_exclusions.append({
-                            'facility_type': kind, 'facility_id': site.site_id,
-                            'latitude': site.latitude, 'longitude': site.longitude,
-                            'reason': 'osrm_driving_strongly_disconnected',
-                            'iteration': len(accessibility_exclusions) + 1,
-                        })
-                eligible_sites[kind] = [s for s in eligible_sites[kind] if s.site_id not in excluded_set]
+    combinations = _experiment_combinations(cfg, choice)
+    batch_status = [dict(index=i + 1, demand_scenario=str(combo[0]),
+                         instance_size=int(combo[1]), demand_seed=int(combo[2]),
+                         choice_seed=int(combo[3]), status='pending',
+                         started_at=None, finished_at=None, elapsed_seconds=None,
+                         output=None, error=None)
+                    for i, combo in enumerate(combinations)]
+    _write_batch_status(batch_dir, batch_status)
+    print(f'[M6 batch] {len(combinations)} runs queued | {batch_dir}', flush=True)
+    for batch_index, (demand_scenario, instance_size, demand_seed, choice_seed) in enumerate(combinations):
+        item = batch_status[batch_index]
+        item['status'] = 'running'
+        item['started_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+        run_tick = time.perf_counter()
+        _write_batch_status(batch_dir, batch_status)
+        print(f'[M6 batch {batch_index + 1}/{len(combinations)}] RUNNING '
+              f'{demand_scenario} {instance_size} demand_seed={demand_seed} '
+              f'choice_seed={choice_seed}', flush=True)
+        try:
+            demand_file = _select_demand_file(city_root/'demand', demand_scenario, int(instance_size), int(demand_seed))
+            customers = _filter_by_zones(load_customers(demand_file), zones)
+            scenario = Scenario(city=city, demand_file=demand_file.name, seed=int(choice_seed),
+                baseline_pudo_probability=float(choice['baseline_pudo_probability']),
+                distance_penalty_per_km=float(choice['distance_penalty_per_km']),
+                osrm_block_size=block_size, osrm_cache_enabled=bool(cache['enabled']),
+                osrm_cache_directory=str(cache['directory']), **defaults)
+            signature = {'city':city, 'demand_scenario':demand_scenario, 'instance_size':instance_size,
+                'demand_seed':demand_seed,'choice_seed':choice_seed,'zones':zones,
+                'supply_routing': cfg.get('supply_routing', {}), 'bike_routing': cfg.get('bike_routing', cfg.get('supply_routing', {})), 'van_routing': cfg.get('van_routing', cfg.get('supply_routing', {})), 'supply': cfg.get('supply', {}), 'warehouses': cfg.get('warehouses'), 'operating_hours': cfg.get('operating_hours')}
+            run_id = (f'{demand_scenario}_{instance_size}_dseed{demand_seed}_cseed{choice_seed}_'
+                      + str(cfg.get('supply_routing', {}).get('routing', {}).get('algorithm', 'cws')) + '_'
+                      + hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()[:8])
+            # One timestamp per experiment batch; individual scenarios are nested inside.
+            output = batch_dir / run_id
+            suffix = 1
+            while output.exists():
+                output = batch_dir / f'{run_id}_{suffix:02d}'
+                suffix += 1
+            output.mkdir(parents=True, exist_ok=False)
+            item["output"] = str(output)
+            _write_batch_status(batch_dir, batch_status)
+            reset_osrm_cache_stats()
+            timing_started = datetime.now().astimezone()
+            timing_tick = time.perf_counter()
+            stage_records = []
+            warehouse_assignments = None
+            resolved_warehouses = None
+            if 'warehouses' in cfg:
+                resolved_warehouses = resolve_warehouses(cfg['warehouses'], sites)
+                warehouse_assignments, summary_warehouses = export_warehouse_assignments(
+                    output, customers, resolved_warehouses)
+            # Preflight both supply legs before exporting operational inputs or routing.
+            # Any excluded facility triggers a full, deterministic reassignment.
+            route_cfg = cfg.get('supply_routing', {})
+            if not isinstance(route_cfg, dict) or 'enabled' in route_cfg:
+                raise ValueError('supply_routing must be an object without enabled')
+            allocations, summary, run_sites, pudo_supply, microhub_supply = _prepare_accessible_supply(
+                output, city, customers, sites, network, scenario,
+                parameters.capacities['van_capacity'], stage_records)
+            if warehouse_assignments is not None:
+                summary['warehouses'] = summary_warehouses
+            summary['supply'] = pudo_supply
+            summary['microhub_supply'] = microhub_supply
+            with _timed_stage('operational_inputs', stage_records):
+                operational_manifest = export_operational_inputs(
+                    output, customers, run_sites, allocations, parameters.capacities,
+                    warehouse_assignments=warehouse_assignments)
+            summary['operational_manifest'] = operational_manifest
+            with _timed_stage('pudo_supply_routing', stage_records):
+                summary['supply_routing'] = (plan_partitioned_supply(
+                    output, city, run_sites, allocations, warehouse_assignments, resolved_warehouses,
+                    parameters.capacities['van_capacity'], route_cfg, data_root=data_root, facility_type='PUDO')
+                    if resolved_warehouses else plan_pudo_supply(
+                    output, city, parameters.capacities['van_capacity'], route_cfg, data_root=data_root))
+            with _timed_stage('microhub_supply_routing', stage_records):
+                summary['microhub_supply_routing'] = (plan_partitioned_supply(
+                    output, city, run_sites, allocations, warehouse_assignments, resolved_warehouses,
+                    parameters.capacities['van_capacity'], route_cfg, data_root=data_root, facility_type='MICROHUB')
+                    if resolved_warehouses else plan_microhub_supply(
+                    output, city, parameters.capacities['van_capacity'], route_cfg, data_root=data_root))
+            expected_hub_packages = summary['packages_by_mode'].get('CARGO_BIKE', 0)
+            if summary['microhub_supply']['packages'] != expected_hub_packages:
+                raise AssertionError('Microhub inbound packages do not match bike delivery demand')
+            if summary['microhub_supply_routing'].get('status') == 'planned' and (
+                abs(summary['microhub_supply_routing']['packages'] - expected_hub_packages) > 1e-6
+            ):
+                raise AssertionError('GLIMS microhub supply routing did not conserve packages')
+            with _timed_stage('bike_delivery_routing', stage_records):
+                summary['bike_routing'] = plan_bike_delivery(
+                    output, city, customers, run_sites, allocations, parameters.capacities['cargo_bike_capacity'],
+                    cfg.get('bike_routing', route_cfg))
+            with _timed_stage('van_delivery_routing', stage_records):
+                summary['van_routing'] = plan_van_delivery(
+                    output, city, customers, run_sites, allocations, parameters.capacities['van_capacity'],
+                    cfg.get('van_routing', route_cfg))
+            if 'operating_hours' in cfg:
+                with _timed_stage('operating_timeline', stage_records):
+                    summary['operating_timeline'] = build_operating_timeline(
+                        output, city, run_sites, cfg['operating_hours'], block_size=block_size)
+            summary['run_id'] = output.name
+            summary['scenario_id'] = run_id
+            summary['demand_scenario'] = demand_scenario
+            summary['demand_seed'] = demand_seed
+            summary['choice_seed'] = choice_seed
+            summary['osrm_cache_stats'] = get_osrm_cache_stats()
+            with _timed_stage('economics_and_emissions', stage_records):
+                summary['economics_environment'] = export_glims_metrics(output, summary, allocations, parameters)
+            (output/'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
+            (output/'config.json').write_text(json.dumps({'experiment':cfg,'infrastructure':infra,
+                'resolved_scenario':asdict(scenario),
+                'parameter_sources': {'model_parameters':str(parameters.model_file.resolve()),
+                                      'cost_parameters':str(parameters.cost_file.resolve())},
+                'loaded_cost_catalogue': parameters.cost_catalogue},indent=2,ensure_ascii=False),encoding='utf-8')
+            _write_csv(output/'audit'/'assignment_integrity.csv', [{
+                'customers_loaded':len(customers),'customers_assigned':len(allocations),
+                'packages_loaded':sum(c.packages for c in customers),
+                'packages_assigned':sum(a.packages for a in allocations),
+                'valid':len(customers)==len(allocations) and sum(c.packages for c in customers)==sum(a.packages for a in allocations)
+            }])
+            _write_csv(output/'facilities'/'facility_summary.csv', [
+                {'facility_id':s.site_id,'facility_type':category,
+                 'customers_assigned':sum(a.facility_id==s.site_id and a.delivery_mode==mode for a in allocations),
+                 'packages_assigned':sum(a.packages for a in allocations if a.facility_id==s.site_id and a.delivery_mode==mode)}
+                for category, mode in [('PUDO','PUDO'),('MICROHUB','CARGO_BIKE')]
+                for s in run_sites[category] if any(a.facility_id==s.site_id and a.delivery_mode==mode for a in allocations)
+            ])
+            with _timed_stage('result_export_and_audit', stage_records):
+                export_run_results(output, summary, allocations)
+                (output / "summary.csv").replace(output / "operation_summary.csv")
+                export_glims_summary(output, summary, parameters)
+                export_route_audit(output, summary, allocations, parameters.capacities)
+                if "operating_hours" in cfg:
+                    summary["schedule_audit"] = reconcile_schedule_diagnostics(output)
+                summary["geography"] = export_geography(output, city_root, customers, run_sites, allocations)
+                (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            summary['execution_timing'] = _write_timing(output, stage_records, timing_started, timing_tick)
+            (output / 'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
+            print(f'Finished {output.name}: {summary["customers_by_mode"]}; cache={summary["osrm_cache_stats"]}')
+            run_summaries.append({'run_id':output.name,'scenario_id':run_id,'city':city,'demand_scenario':demand_scenario,
+                'instance_size':instance_size,'demand_seed':demand_seed,'choice_seed':choice_seed,
+                **{f'customers_{k}':v for k,v in summary['customers_by_mode'].items()},
+                **{f'packages_{k}':v for k,v in summary['packages_by_mode'].items()}})
+        except BaseException as exc:
+            item['status'] = 'failed'
+            item['error'] = f'{type(exc).__name__}: {exc}'
+            item['finished_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            item['elapsed_seconds'] = round(time.perf_counter() - run_tick, 3)
+            _write_batch_status(batch_dir, batch_status)
+            print(f'[M6 batch {batch_index + 1}/{len(combinations)}] FAILED: {item["error"]}', flush=True)
+            raise
         else:
-            raise RuntimeError('Facility accessibility preflight did not converge')
-        if accessibility_exclusions:
-            _write_csv(output / 'audit' / 'excluded_supply_facilities.csv', accessibility_exclusions)
-        summary['excluded_supply_facilities'] = accessibility_exclusions
-        # Downstream exports must reflect the same eligible facility universe.
-        sites = eligible_sites
-        operational_manifest = export_operational_inputs(output, customers, sites, allocations, parameters.capacities)
-        summary['operational_manifest'] = operational_manifest
-        # GLIMS is a required dependency, not a configurable backend.
-        # PUDO supply and routing always run when PUDO demand exists.
-        supply_settings = cfg.get('supply', {})
-        if not isinstance(supply_settings, dict):
-            raise ValueError('supply must be an object')
-        if 'enabled' in supply_settings or 'select_center' in supply_settings:
-            raise ValueError('Remove supply.enabled/select_center: PUDO supply always uses GLIMS')
-        route_cfg = cfg.get('supply_routing', {})
-        if not isinstance(route_cfg, dict) or 'enabled' in route_cfg:
-            raise ValueError('supply_routing must be an object without enabled')
-        if 'glims_supply' in cfg or 'glims_supply_routing' in cfg:
-            raise ValueError('Rename glims_supply -> supply and glims_supply_routing -> supply_routing; remove enabled/select_center')
-        summary['supply'] = prepare_pudo_supply(
-            output, sites, allocations, parameters.capacities['van_capacity'], city)
-        summary['supply_routing'] = plan_pudo_supply(
-            output, city, parameters.capacities['van_capacity'], route_cfg, data_root=data_root)
-        summary['microhub_supply'] = prepare_microhub_supply(
-            output, sites, allocations, parameters.capacities['van_capacity'], city)
-        summary['microhub_supply_routing'] = plan_microhub_supply(
-            output, city, parameters.capacities['van_capacity'], route_cfg, data_root=data_root)
-        expected_hub_packages = summary['packages_by_mode'].get('CARGO_BIKE', 0)
-        if summary['microhub_supply']['packages'] != expected_hub_packages:
-            raise AssertionError('Microhub inbound packages do not match bike delivery demand')
-        if summary['microhub_supply_routing'].get('status') == 'planned' and (
-            abs(summary['microhub_supply_routing']['packages'] - expected_hub_packages) > 1e-6
-        ):
-            raise AssertionError('GLIMS microhub supply routing did not conserve packages')
-        summary['bike_routing'] = plan_bike_delivery(
-            output, city, customers, sites, allocations, parameters.capacities['cargo_bike_capacity'],
-            cfg.get('bike_routing', route_cfg))
-        summary['van_routing'] = plan_van_delivery(
-            output, city, customers, sites, allocations, parameters.capacities['van_capacity'],
-            cfg.get('van_routing', route_cfg))
-        # Assigned demand is conserved; VAN exclusions are explicitly unserved.
-        summary['unroutable_van_customers'] = summary['van_routing']['unroutable_customer_count']
-        summary['unroutable_van_packages'] = summary['van_routing']['unroutable_package_count']
-        summary['served_packages'] = (sum(summary['packages_by_mode'].values())
-                                      - summary['unroutable_van_packages'])
-        summary['run_id'] = output.name
-        summary['scenario_id'] = run_id
-        summary['demand_scenario'] = demand_scenario
-        summary['demand_seed'] = demand_seed
-        summary['choice_seed'] = choice_seed
-        summary['osrm_cache_stats'] = get_osrm_cache_stats()
-        summary['economics_environment'] = export_glims_metrics(output, summary, allocations, parameters)
-        (output/'summary.json').write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
-        (output/'config.json').write_text(json.dumps({'experiment':cfg,'infrastructure':infra,
-            'resolved_scenario':asdict(scenario),
-            'parameter_sources': {'model_parameters':str(parameters.model_file.resolve()),
-                                  'cost_parameters':str(parameters.cost_file.resolve())},
-            'loaded_cost_catalogue': parameters.cost_catalogue},indent=2,ensure_ascii=False),encoding='utf-8')
-        _write_csv(output/'audit'/'assignment_integrity.csv', [{
-            'customers_loaded':len(customers),'customers_assigned':len(allocations),
-            'packages_loaded':sum(c.packages for c in customers),
-            'packages_assigned':sum(a.packages for a in allocations),
-            'valid':len(customers)==len(allocations) and sum(c.packages for c in customers)==sum(a.packages for a in allocations)
-        }])
-        _write_csv(output/'facilities'/'facility_summary.csv', [
-            {'facility_id':s.site_id,'facility_type':category,
-             'customers_assigned':sum(a.facility_id==s.site_id and a.delivery_mode==mode for a in allocations),
-             'packages_assigned':sum(a.packages for a in allocations if a.facility_id==s.site_id and a.delivery_mode==mode)}
-            for category, mode in [('PUDO','PUDO'),('MICROHUB','CARGO_BIKE')]
-            for s in sites[category] if any(a.facility_id==s.site_id and a.delivery_mode==mode for a in allocations)
-        ])
-        export_run_results(output, summary, allocations)
-        (output / "summary.csv").replace(output / "operation_summary.csv")
-        export_glims_summary(output, summary, parameters)
-        export_route_audit(output, summary, allocations, parameters.capacities)
-        summary["geography"] = export_geography(output, city_root, customers, sites, allocations)
-        (output / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-        print(f'Finished {output.name}: {summary["customers_by_mode"]}; cache={summary["osrm_cache_stats"]}')
-        run_summaries.append({'run_id':output.name,'scenario_id':run_id,'city':city,'demand_scenario':demand_scenario,
-            'instance_size':instance_size,'demand_seed':demand_seed,'choice_seed':choice_seed,
-            **{f'customers_{k}':v for k,v in summary['customers_by_mode'].items()},
-            **{f'packages_{k}':v for k,v in summary['packages_by_mode'].items()}})
+            item['status'] = 'completed'
+            item['finished_at'] = datetime.now().astimezone().isoformat(timespec='seconds')
+            item['elapsed_seconds'] = round(time.perf_counter() - run_tick, 3)
+            _write_batch_status(batch_dir, batch_status)
+            print(f'[M6 batch {batch_index + 1}/{len(combinations)}] COMPLETED '
+                  f'in {item["elapsed_seconds"]:.1f} s', flush=True)
     # The experiment-level file is an index, not a per-run summary.
     aggregate_dir = batch_dir
     legacy_summary = aggregate_dir / 'summary.csv'
